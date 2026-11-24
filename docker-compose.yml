@@ -1,0 +1,21 @@
+services:
+  pc_oficina:
+    image: alpine:latest
+    container_name: pc_oficina
+    command: sleep infinity
+    networks:
+      - red_oficina
+
+  nodo_red:
+    image: alpine:latest
+    container_name: nodo_red
+    command: sleep infinity
+    networks:
+      - red_oficina
+
+networks:
+  red_oficina:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 192.168.10.0/24
