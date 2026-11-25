@@ -1,0 +1,35 @@
+#!/bin/sh
+# Script que ejecuta udhcpc en cada etapa del ciclo DHCP.
+# Es la parte "visible" del cliente: recibe lo que el servidor mando en el
+# DHCPACK y lo aplica a la interfaz.
+#
+# Variables que entrega udhcpc:
+#   $interface  interfaz (eth0)
+#   $ip         IP asignada
+#   $mask       mascara de subred
+#   $router     gateway(s) separados por espacios
+#   $dns        servidores DNS separados por espacios
+#   $serverid   IP del servidor DHCP
+#   $lease      duracion de la concesion en segundos
+
+case "$1" in
+    deconfig)
+        # Se ejecuta cuando el cliente se queda sin concesion
+        ip addr flush dev "$interface"
+        ;;
+    bound|renew)
+        # Concesion nueva (bound) o renovacion (renew)
+        ip addr flush dev "$interface"
+        ip addr add "$ip/$mask" dev "$interface"
+        if [ -n "$router" ]; then
+            # Usamos el primer gateway entregado por el servidor
+            set -- $router
+            ip route replace default via "$1" dev "$interface"
+        fi
+        ;;
+    leasefail)
+        echo "[udhcpc] no se pudo obtener una concesion" >&2
+        ;;
+esac
+
+exit 0

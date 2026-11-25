@@ -1,0 +1,7 @@
+# Los scripts de shell se montan dentro de contenedores Linux: si se clonan
+# con finales de linea CRLF (Windows) fallan con "/bin/sh^M: bad interpreter".
+* text=auto eol=lf
+*.sh text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.py text eol=lf

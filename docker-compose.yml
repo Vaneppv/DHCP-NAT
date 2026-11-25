@@ -1,76 +1,130 @@
+# Laboratorio DHCP + NAT
+# ---------------------------------------------------------------------------
+# Topologia:
+#
+#   pc_oficina (DHCP) ---+
+#                        |   red_oficina 192.168.10.0/24
+#   nodo_red  .3 --------+-------------- router_nat .254 ---- red_externa ---- servidor_externo
+#   dhcp_server .2 ------+               (NAT / firewall)      10.99.0.0/24      10.99.0.2
+#
+# Uso:
+#   docker compose up -d --build
+#   docker compose ps
+#   docker compose down
+# ---------------------------------------------------------------------------
+
+name: dhcp-nat
+
+x-lab: &lab
+  image: redes-lab:latest
+
 services:
+  # Servidor DHCP de la red de oficina (dnsmasq).
+  # Es el unico servicio que declara "build": construye la imagen comun que
+  # usan todos los contenedores (Compose la construye antes de crearlos).
   dhcp_server:
-    image: alpine:latest
+    <<: *lab
+    build:
+      context: ./docker
+      dockerfile: Dockerfile
     container_name: dhcp_server
     cap_add:
       - NET_ADMIN
+      - NET_RAW
     networks:
       red_oficina:
         ipv4_address: 192.168.10.2
-    command: >
-      sh -c "apk add --no-cache dnsmasq &&
-      dnsmasq --no-daemon --interface=eth0
-      --dhcp-range=192.168.10.50,192.168.10.80,255.255.255.0,12h
-      --dhcp-option=option:router,192.168.10.254
-      --dhcp-option=option:dns-server,8.8.8.8
-      --dhcp-leasefile=/tmp/dnsmasq.leases
-      --log-dhcp"
+    volumes:
+      - ./docker/dhcp:/opt/dhcp:ro
+    command: ["sh", "/opt/dhcp/entrypoint.sh"]
+    restart: unless-stopped
 
+  # Router: una pata en la red interna y otra en la externa.
   router_nat:
-    image: alpine:latest
+    <<: *lab
     container_name: router_nat
     cap_add:
       - NET_ADMIN
+      - NET_RAW
     sysctls:
       net.ipv4.ip_forward: "1"
-    depends_on:
-      - dhcp_server
     networks:
       red_oficina:
         ipv4_address: 192.168.10.254
       red_externa:
-    command: >
-      sh -c "apk add --no-cache iptables &&
-      ip route replace default via 10.99.0.1 &&
-      iptables -P FORWARD ACCEPT &&
-      iptables -t nat -A POSTROUTING -s 192.168.10.0/24 -j MASQUERADE &&
-      sleep infinity"
+        ipv4_address: 10.99.0.254
+    volumes:
+      - ./docker/router:/opt/router:ro
+    command: ["sh", "/opt/router/entrypoint.sh"]
+    depends_on:
+      - dhcp_server
+    restart: unless-stopped
 
+  # Cliente DHCP. La MAC es fija para que el servidor siempre le reserve .50.
   pc_oficina:
-    image: alpine:latest
+    <<: *lab
     container_name: pc_oficina
+    mac_address: "02:42:ac:11:00:50"
     cap_add:
       - NET_ADMIN
+      - NET_RAW
+    networks:
+      - red_oficina
+    volumes:
+      - ./docker/pc:/opt/pc:ro
+      - ./web/interno:/srv:ro
+    command: ["sh", "/opt/pc/entrypoint.sh"]
     depends_on:
       - dhcp_server
       - router_nat
-    networks:
-      - red_oficina
-    command: >
-      sh -c "sleep 6 &&
-      ip addr flush dev eth0 &&
-      udhcpc -i eth0 -n -q ;
-      ip route del default via 192.168.10.1 2>/dev/null || true ;
-      ip route show default | grep -q . || ip route add default via 192.168.10.254 dev eth0 ;
-      sleep infinity"
+    restart: unless-stopped
 
+  # Host interno con IP fija: sirve para probar conectividad dentro de la LAN.
   nodo_red:
-    image: alpine:latest
+    <<: *lab
     container_name: nodo_red
-    command: sleep infinity
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
     networks:
       red_oficina:
         ipv4_address: 192.168.10.3
+    command: ["sh", "-c", "ip route replace default via 192.168.10.254 && exec sleep infinity"]
+    depends_on:
+      - router_nat
+    restart: unless-stopped
+
+  # Host "de Internet": recibe el trafico NATeado de la oficina.
+  servidor_externo:
+    <<: *lab
+    container_name: servidor_externo
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    networks:
+      red_externa:
+        ipv4_address: 10.99.0.2
+    volumes:
+      - ./docker/externo:/opt/externo:ro
+      - ./web/externo:/srv:ro
+    command: ["sh", "/opt/externo/entrypoint.sh"]
+    depends_on:
+      - router_nat
+    restart: unless-stopped
 
 networks:
   red_oficina:
     driver: bridge
     ipam:
       config:
+        # Docker asigna IPs dinamicas a partir de .96 para no chocar con el
+        # rango que reparte el servidor DHCP (.50-.80) ni con las IPs fijas.
         - subnet: 192.168.10.0/24
+          gateway: 192.168.10.1
           ip_range: 192.168.10.96/27
   red_externa:
     driver: bridge
     ipam:
       config:
         - subnet: 10.99.0.0/24
+          gateway: 10.99.0.1

@@ -1,0 +1,53 @@
+# Laboratorio 2: implementacion propia de DHCP en Python
+# ---------------------------------------------------------------------------
+# Levanta UN contenedor conectado a una red aislada (192.168.50.0/24) y
+# ejecuta demo_dora.py en modo red: el servidor y el cliente DHCP son los
+# archivos de dhcp_py/, usando los puertos reales 67 y 68 y broadcast.
+#
+#   docker compose -f docker-compose.dhcp-py.yml up --build
+#
+# El proceso termina solo cuando termina la demostracion.
+# ---------------------------------------------------------------------------
+
+name: dhcp-nat-python
+
+services:
+  demo_dhcp_python:
+    image: redes-lab:latest
+    build:
+      context: ./docker
+      dockerfile: Dockerfile
+    container_name: demo_dhcp_python
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    volumes:
+      - ./dhcp_py:/app:ro
+    networks:
+      red_py:
+        ipv4_address: 192.168.50.2
+    command:
+      - python3
+      - -u
+      - /app/demo_dora.py
+      - --modo
+      - red
+      - --interface
+      - eth0
+      - --broadcast
+      - 192.168.50.255
+      - --range
+      - 192.168.50.100-192.168.50.120
+      - --router
+      - 192.168.50.1
+      - --dns
+      - 8.8.8.8,1.1.1.1
+      - --configure
+
+networks:
+  red_py:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 192.168.50.0/24
+          gateway: 192.168.50.1
