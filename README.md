@@ -177,15 +177,29 @@ docker exec pc_oficina sh -c \
   "ip addr flush dev eth0; ip link set eth0 up; udhcpc -i eth0 -n -q -f -s /opt/pc/udhcpc.script"
 
 docker exec pc_oficina sh -c "pkill -INT tcpdump; sleep 1"
-docker exec pc_oficina tcpdump -nn -r /tmp/dora.pcap
+docker exec pc_oficina tcpdump -nn -v -r /tmp/dora.pcap
 ```
 
 ```text
-IP 0.0.0.0.68 > 255.255.255.255.67: BOOTP/DHCP, Request from 02:42:ac:11:00:50, length 279
-IP 192.168.10.2.67 > 255.255.255.255.68: BOOTP/DHCP, Reply, length 299
-IP 0.0.0.0.68 > 255.255.255.255.67: BOOTP/DHCP, Request from 02:42:ac:11:00:50, length 293
-IP 192.168.10.2.67 > 255.255.255.255.68: BOOTP/DHCP, Reply, length 311
+IP 0.0.0.0.68 > 255.255.255.255.67: BOOTP/DHCP, Request from 02:42:ac:11:00:50, length 300, xid 0xbdf79b6e, Flags [none]
+        DHCP-Message (53), length 1: Discover
+IP 192.168.10.2.67 > 192.168.10.50.68: BOOTP/DHCP, Reply, length 323, xid 0xbdf79b6e, Flags [none]
+        DHCP-Message (53), length 1: Offer
+IP 0.0.0.0.68 > 255.255.255.255.67: BOOTP/DHCP, Request from 02:42:ac:11:00:50, length 300, xid 0xbdf79b6e, Flags [none]
+        DHCP-Message (53), length 1: Request
+IP 192.168.10.2.67 > 192.168.10.50.68: BOOTP/DHCP, Reply, length 323, xid 0xbdf79b6e, Flags [none]
+        DHCP-Message (53), length 1: ACK
 ```
+
+Observaciones para la defensa:
+
+- El **xid** es el mismo en los cuatro mensajes: identifica la transacción.
+- `DISCOVER` y `REQUEST` salen de `0.0.0.0:68` hacia `255.255.255.255:67`
+  (broadcast), porque el cliente todavía no tiene IP.
+- `OFFER` y `ACK` viajan en unicast a la IP ofrecida, dirigidos a la MAC del
+  cliente. El servidor puede hacerlo porque conoce esa MAC desde el `chaddr`
+  (dnsmasq usa un socket raw para entregar el paquete antes de que el cliente
+  tenga la IP configurada).
 
 Todo el procedimiento está automatizado en:
 
@@ -260,6 +274,10 @@ Chain PREROUTING (policy ACCEPT 0 packets, 0 bytes)
 ```
 
 Los contadores `pkts`/`bytes` son la prueba de que el tráfico pasó por la regla.
+Ojo: la tabla `nat` solo se consulta para el **primer paquete de cada
+conexión**; los siguientes ya están traducidos en la tabla de conntrack y no
+vuelven a pasar por la regla. Por eso el contador sube de a 1 por conexión,
+no por paquete.
 
 ### 5.3 Probar la salida (SNAT)
 
@@ -301,7 +319,17 @@ docker exec servidor_externo curl -sS http://10.99.0.254:8080/
 ```
 
 Devuelve la página **"Servidor interno"** (`192.168.10.50:8000`), que no tiene
-IP pública: se llegó por el port forwarding del router.
+IP pública: se llegó por el port forwarding del router. En el log del servidor
+interno se ve que la visita llega con la IP original del cliente externo
+(`10.99.0.2`), porque el DNAT cambia el destino pero no el origen:
+
+```bash
+docker exec pc_oficina tail -3 /tmp/http.log
+```
+
+```text
+10.99.0.2 - - [..] "GET / HTTP/1.1" 200 -
+```
 
 ```bash
 python3 demo_redes.py dnat
@@ -456,6 +484,7 @@ En Linux sin permisos de Docker, el script detecta y reintenta con `sudo`
 | Síntoma | Causa / solución |
 |---|---|
 | `permission denied ... docker.sock` | Agregar el usuario al grupo `docker` o usar `sudo`. |
+| `error getting credentials ... docker-credential-desktop` | `~/.docker/config.json` tiene `"credsStore": "desktop"` (config copiada de Docker Desktop). En Linux, quitar esa línea o instalar el helper. |
 | `iptables: can't initialize iptables table 'nat'` | El kernel no expone NAT al contenedor. En el host: `sudo modprobe nf_nat` y reiniciar Docker. |
 | `pc_oficina` no tiene IP `.50` | Ver `docker logs pc_oficina`. Puede que el servidor no haya arrancado: `docker logs dhcp_server`. |
 | El ping a `8.8.8.8` falla | La red de la facultad puede bloquear ICMP. No afecta al resto de la demo. |

@@ -79,6 +79,38 @@ def fail(text: str) -> None:
     print(f"  {RED}x{RESET} {text}", file=sys.stderr)
 
 
+def dnsmasq_events(lab: "Lab", tail: int = 8) -> None:
+    """Muestra solo las lineas de DORA del log de dnsmasq (sin el volcado de opciones)."""
+    print(f"{DIM}$ docker logs dhcp_server   (filtrando solo los mensajes DORA){RESET}")
+    lines = [
+        line
+        for line in lab.output("logs", "dhcp_server").splitlines()
+        if any(marker in line for marker in
+               ("DHCPDISCOVER(", "DHCPOFFER(", "DHCPREQUEST(", "DHCPACK("))
+    ]
+    if not lines:
+        warn("Todavia no hay eventos DHCP en el log.")
+        return
+    for line in lines[-tail:]:
+        print("  " + line)
+
+
+def wait_for_process(
+    lab: "Lab", container: str, name: str, present: bool = True, timeout: float = 8.0
+) -> bool:
+    """Espera a que un proceso aparezca (o desaparezca) dentro de un contenedor.
+
+    Evita la condicion de carrera de arrancar tcpdump en segundo plano y lanzar
+    el trafico antes de que el sniffer este escuchando.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if bool(lab.output("exec", container, "pgrep", name)) == present:
+            return True
+        time.sleep(0.1)
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Acceso a Docker
 # ---------------------------------------------------------------------------
@@ -91,11 +123,12 @@ class Lab:
     """Encapsula como llamar a docker / docker compose segun el sistema."""
 
     def __init__(self) -> None:
-        self.docker = self._detect_docker()
-        if self.docker == ["sudo"]:
+        self.prefix = self._detect_docker()
+        self.docker = self.prefix + ["docker"]
+        if self.prefix == ["sudo"]:
             # Pedir la contrasena una sola vez, al inicio, y validar el acceso.
             result = subprocess.run(
-                self.docker + ["docker", "info"], stdout=subprocess.DEVNULL, check=False
+                self.docker + ["info"], stdout=subprocess.DEVNULL, check=False
             )
             if result.returncode != 0:
                 raise DockerError(
@@ -171,8 +204,9 @@ class Lab:
         return result
 
     def compose_cmd(self) -> list[str]:
-        # ['docker', 'compose', ...] o ['docker', 'docker-compose', ...] era el bug
-        return self.docker + self.compose
+        if self.compose == ["compose"]:
+            return self.docker + ["compose"]
+        return self.prefix + ["docker-compose"]
 
     def comp(self, *args: str, **kwargs) -> subprocess.CompletedProcess:
         return self.run(self.compose_cmd() + list(args), **kwargs)
@@ -184,8 +218,9 @@ class Lab:
         return self.d("exec", container, "sh", "-c", script, **kwargs)
 
     def output(self, *args: str) -> str:
+        # docker logs escribe en stderr, ip/tcpdump en stdout: unimos ambos.
         result = self.d(*args, capture=True, quiet=True, timeout=30)
-        return result.stdout.strip()
+        return ((result.stdout or "") + (result.stderr or "")).strip()
 
     def is_running(self, container: str) -> bool:
         return self.output("inspect", "-f", "{{.State.Running}}", container) == "true"
@@ -280,7 +315,11 @@ dnsmasq guarda cada concesion en /tmp/dnsmasq.leases:
     lab.d("exec", "dhcp_server", "cat", "/tmp/dnsmasq.leases")
 
     step("d", "Ultimos mensajes del servidor DHCP")
-    lab.d("logs", "--tail", "15", "dhcp_server")
+    explain("""
+Cada linea es un mensaje del protocolo: se ve el nombre del evento, la
+interfaz, la IP y la MAC. El numero inicial es un id interno de dnsmasq.
+""")
+    dnsmasq_events(lab, tail=8)
 
 
 def action_dora(lab: Lab) -> None:
@@ -294,16 +333,27 @@ DHCP usa 4 mensajes (DORA):
   2. OFFER     el servidor ofrece una IP libre
   3. REQUEST   el cliente pide formalmente esa IP
   4. ACK       el servidor confirma la concesion
-Como el cliente todavia no tiene IP, los mensajes van por broadcast
-(destino 255.255.255.255), por eso tcpdump los puede ver en eth0.
+Como el cliente todavia no tiene IP, sus mensajes van por broadcast
+(destino 255.255.255.255); el servidor puede responder en unicast a la
+IP ofrecida, dirigiendose a la MAC del cliente. Por eso tcpdump ve los
+dos sentidos en eth0.
 """)
 
     step("1/5", "Iniciando captura con tcpdump dentro de pc_oficina")
+    explain("""
+Se capturan exactamente 4 paquetes (-c 4) y se escriben sin buffer (-U),
+para que el archivo quede completo aunque tcpdump siga corriendo.
+""")
+    lab.sh("pc_oficina", "pkill -INT tcpdump 2>/dev/null || true; "
+                         "while pgrep tcpdump >/dev/null; do sleep 0.1; done; "
+                         "rm -f /tmp/dora.pcap")
     lab.d(
         "exec", "-d", "pc_oficina", "sh", "-c",
-        "rm -f /tmp/dora.pcap; exec tcpdump -i eth0 -w /tmp/dora.pcap 'udp port 67 or udp port 68'",
+        "exec tcpdump -U -i eth0 -c 4 -w /tmp/dora.pcap 'udp port 67 or udp port 68'",
     )
-    time.sleep(1.5)
+    if not wait_for_process(lab, "pc_oficina", "tcpdump", present=True):
+        warn("tcpdump no llego a arrancar; se intenta igual la captura.")
+    time.sleep(1.0)
 
     step("2/5", "Borrando la IP actual y pidiendo una nueva por DHCP")
     explain("Al borrar la IP, forzamos el ciclo completo desde DISCOVER.")
@@ -311,19 +361,26 @@ Como el cliente todavia no tiene IP, los mensajes van por broadcast
                          "udhcpc -i eth0 -n -q -f -s /opt/pc/udhcpc.script")
 
     step("3/5", "Deteniendo la captura")
-    lab.sh("pc_oficina", "pkill -INT tcpdump; sleep 1")
+    # tcpdump sale solo al capturar los 4 paquetes; si no, lo cortamos.
+    wait_for_process(lab, "pc_oficina", "tcpdump", present=False, timeout=6.0)
+    lab.sh("pc_oficina", "pkill -INT tcpdump 2>/dev/null || true; "
+                         "while pgrep tcpdump >/dev/null; do sleep 0.1; done; sleep 0.3")
 
     step("4/5", "Paquetes DHCP capturados (DORA)")
     explain("""
-En la salida se ven los 4 mensajes. Fijate que:
+En la salida se ven los 4 mensajes, con su tipo (opcion 53) y el mismo
+xid en todos. Ademas:
   * DISCOVER y REQUEST salen del puerto 68 hacia el 67 (broadcast)
   * OFFER y ACK salen del puerto 67 hacia el 68
-  * el xid (identificador de transaccion) es el mismo en los cuatro
 """)
-    lab.d("exec", "pc_oficina", "tcpdump", "-nn", "-r", "/tmp/dora.pcap")
+    print(f"{DIM}$ docker exec pc_oficina tcpdump -nn -v -r /tmp/dora.pcap{RESET}")
+    capture = lab.output("exec", "pc_oficina", "tcpdump", "-nn", "-v", "-r", "/tmp/dora.pcap")
+    print(capture)
+    if "DHCP-Message" not in capture:
+        warn("La captura quedo vacia; volve a ejecutar la accion.")
 
     step("5/5", "Registro del servidor DHCP (lado servidor)")
-    lab.d("logs", "--tail", "25", "dhcp_server")
+    dnsmasq_events(lab, tail=4)
 
     print()
     ok("La IP se renovo y sigue siendo la misma (el servidor recuerda la concesion por MAC).")
@@ -374,11 +431,15 @@ funciona, la IP de origen NO sera 192.168.10.50 sino la del router.
     lab.d("exec", "router_nat", "iptables", "-t", "nat", "-L", "POSTROUTING", "-v", "-n")
 
     step("2/5", "Iniciando captura en el servidor externo")
+    lab.sh("servidor_externo", "pkill -INT tcpdump 2>/dev/null || true; "
+                               "while pgrep tcpdump >/dev/null; do sleep 0.1; done; "
+                               "rm -f /tmp/nat.pcap")
     lab.d(
         "exec", "-d", "servidor_externo", "sh", "-c",
-        "rm -f /tmp/nat.pcap; exec tcpdump -i eth0 -w /tmp/nat.pcap 'tcp port 8000'",
+        "exec tcpdump -U -i eth0 -w /tmp/nat.pcap 'tcp port 8000'",
     )
-    time.sleep(1.5)
+    wait_for_process(lab, "servidor_externo", "tcpdump", present=True)
+    time.sleep(0.5)
 
     step("3/5", "Solicitando la pagina desde pc_oficina")
     lab.d(
@@ -389,7 +450,8 @@ funciona, la IP de origen NO sera 192.168.10.50 sino la del router.
     lab.sh("pc_oficina", "grep -o '<title>[^<]*</title>' /tmp/respuesta.html || true")
 
     step("4/5", "Deteniendo la captura y leyendo los paquetes")
-    lab.sh("servidor_externo", "pkill -INT tcpdump; sleep 1")
+    lab.sh("servidor_externo", "pkill -INT tcpdump 2>/dev/null || true; "
+                               "while pgrep tcpdump >/dev/null; do sleep 0.1; done")
     explain("""
 Mira la columna de origen: los paquetes llegan desde 10.99.0.254 (la IP
 del router), no desde 192.168.10.50. Eso es exactamente lo que hace el
@@ -399,6 +461,13 @@ se la entrega al cliente.
     lab.d("exec", "servidor_externo", "tcpdump", "-nn", "-r", "/tmp/nat.pcap", "-c", "8")
 
     step("5/5", "Contadores DESPUES del trafico y log del servidor")
+    explain("""
+Ojo: el contador de MASQUERADE sube de a 1 por conexion, no por paquete.
+La tabla nat solo se consulta para el primer paquete de cada conexion;
+los siguientes ya estan traducidos en la tabla de conntrack y no vuelven
+a pasar por la regla. El contador es la prueba de que la conexion se
+tradujo.
+""")
     lab.d("exec", "router_nat", "iptables", "-t", "nat", "-L", "POSTROUTING", "-v", "-n")
     lab.d("logs", "--tail", "5", "servidor_externo")
 
@@ -416,16 +485,23 @@ devolver las respuestas al cliente correcto. Cada linea muestra:
   src=IP:puerto_privada  dst=IP:puerto_destino
   src=IP:puerto_publica  dst=IP:puerto_origen
 """)
-    lab.sh(
-        "router_nat",
-        "cat /proc/net/nf_conntrack 2>/dev/null | grep -E '8000|8080' | head -20 || true",
+    print(f"{DIM}$ cat /proc/net/nf_conntrack | grep -E '8000|8080'{RESET}")
+    data = lab.output(
+        "exec", "router_nat", "sh", "-c",
+        "cat /proc/net/nf_conntrack 2>/dev/null | grep -E '8000|8080' || true",
     )
-    print()
-    explain("""
-Si la tabla aparece vacia, no es un error del laboratorio: algunos kernels
-no exponen /proc/net/nf_conntrack dentro del contenedor. En ese caso los
-contadores de iptables siguen siendo la prueba (accion 'nat').
+    if data:
+        for line in data.splitlines():
+            print("  " + line)
+    else:
+        warn("Este kernel no expone /proc/net/nf_conntrack dentro del contenedor.")
+        explain("""
+No es un error del laboratorio: la opcion CONFIG_NF_CONNTRACK_PROCFS
+puede estar deshabilitada. La traduccion existe igual (si no, el trafico
+no funcionaria). Veamos la prueba equivalente: los contadores de las
+reglas NAT.
 """)
+        lab.d("exec", "router_nat", "iptables", "-t", "nat", "-L", "-v", "-n")
 
 
 def action_dnat(lab: Lab) -> None:
@@ -453,7 +529,9 @@ Vamos a pedirlo desde el servidor externo (como si fueramos Internet).
     step("3/3", "Log del servidor interno: quien lo visito")
     explain("""
 El DNAT cambia la IP de destino a 192.168.10.50 antes de reenviar el
-paquete. El servidor interno ve la conexion como si viniera del router.
+paquete, pero deja intacta la IP de origen: por eso el servidor interno
+ve la IP original del cliente externo (10.99.0.2). La respuesta vuelve
+por el router, que la traduce de vuelta al puerto 8080.
 """)
     lab.sh("pc_oficina", "tail -3 /tmp/http.log || true")
 
@@ -553,6 +631,15 @@ def menu(lab: Lab, pause: bool) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Sin esto, al redirigir la salida (por ejemplo a un archivo o a `tee`)
+    # las lineas del script quedan bufferizadas y se mezclan con las de
+    # docker/tcpdump, que escriben directo al pipe.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+        sys.stderr.reconfigure(line_buffering=True)
+    except AttributeError:  # Python < 3.7
+        pass
+
     parser = argparse.ArgumentParser(
         description="Demo interactiva del laboratorio DHCP + NAT sobre Docker",
         formatter_class=argparse.RawDescriptionHelpFormatter,
